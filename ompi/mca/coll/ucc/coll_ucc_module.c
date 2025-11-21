@@ -18,6 +18,8 @@
 #include "coll_ucc_dtypes.h"
 #include "ompi/mca/coll/base/coll_tags.h"
 #include "ompi/mca/pml/pml.h"
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int ucc_comm_attr_keyval;
 /*
@@ -249,6 +251,123 @@ static ucc_status_t oob_allgather(void *sbuf, void *rbuf, size_t msglen,
 }
 
 
+/*
+ * Helper function: Check if a network device exists on the system
+ */
+static int mca_coll_ucc_device_exists(const char *device_with_port)
+{
+    char device_name[256];
+    char device_path[512];
+    char *colon;
+    struct stat st;
+
+    /* Extract device name (part before ':') */
+    strncpy(device_name, device_with_port, sizeof(device_name) - 1);
+    device_name[sizeof(device_name) - 1] = '\0';
+
+    colon = strchr(device_name, ':');
+    if (colon) {
+        *colon = '\0';
+    }
+
+    /* Check for InfiniBand devices in /sys/class/infiniband/ */
+    snprintf(device_path, sizeof(device_path), "/sys/class/infiniband/%s", device_name);
+    if (stat(device_path, &st) == 0) {
+        UCC_VERBOSE(5, "Found InfiniBand device: %s", device_path);
+        return 1;
+    }
+
+    /* Check for network devices in /sys/class/net/ */
+    snprintf(device_path, sizeof(device_path), "/sys/class/net/%s", device_name);
+    if (stat(device_path, &st) == 0) {
+        UCC_VERBOSE(5, "Found network device: %s", device_path);
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Pre-flight check: Validate UCX_NET_DEVICES environment variable format
+ * before attempting UCC initialization. UCX requires device names in the
+ * format "device:port" (e.g., mlx5_0:1), not just "device" (e.g., mlx5_0).
+ * Invalid format or non-existent devices cause segfaults inside ucc_context_create().
+ */
+static int mca_coll_ucc_validate_ucx_devices(void)
+{
+    char *ucx_net_devices;
+    char *device_list;
+    char *device;
+    char *saveptr;
+    int has_invalid_format = 0;
+
+    /* Check if UCX_NET_DEVICES is set */
+    ucx_net_devices = getenv("UCX_NET_DEVICES");
+    if (NULL == ucx_net_devices || strlen(ucx_net_devices) == 0) {
+        /* Not set - let UCX use defaults */
+        UCC_VERBOSE(3, "UCX_NET_DEVICES not set, using UCX defaults");
+        return OMPI_SUCCESS;
+    }
+
+    UCC_VERBOSE(3, "Validating UCX_NET_DEVICES=%s", ucx_net_devices);
+
+    /* Make a copy for tokenization */
+    device_list = strdup(ucx_net_devices);
+    if (NULL == device_list) {
+        UCC_ERROR("Failed to allocate memory for UCX_NET_DEVICES validation");
+        return OMPI_ERROR;
+    }
+
+    /* Check each device in the comma-separated list */
+    device = strtok_r(device_list, ",", &saveptr);
+    while (NULL != device) {
+        /* Trim leading/trailing whitespace */
+        while (*device == ' ' || *device == '\t') device++;
+
+        /* Skip empty tokens */
+        if (strlen(device) == 0) {
+            device = strtok_r(NULL, ",", &saveptr);
+            continue;
+        }
+
+        /* Check if device contains ':' (port specification) */
+        if (NULL == strchr(device, ':')) {
+            UCC_ERROR("UCX_NET_DEVICES validation failed: device '%s' is missing port specification. "
+                      "UCX requires format 'device:port' (e.g., 'mlx5_0:1' not 'mlx5_0'). "
+                      "This will cause segmentation fault in ucc_context_create(). "
+                      "Please correct UCX_NET_DEVICES environment variable.", device);
+            has_invalid_format = 1;
+            break;
+        }
+
+        /* Check if device actually exists on the system */
+        if (!mca_coll_ucc_device_exists(device)) {
+            UCC_ERROR("UCX_NET_DEVICES validation failed: device '%s' does not exist on this system. "
+                      "This will cause segmentation fault in ucc_context_create(). "
+                      "Available devices can be found in /sys/class/infiniband/ or /sys/class/net/. "
+                      "Please correct UCX_NET_DEVICES environment variable or unset it to use defaults.",
+                      device);
+            has_invalid_format = 1;
+            break;
+        }
+
+        UCC_VERBOSE(5, "UCX_NET_DEVICES device '%s' validated: format OK and device exists", device);
+        device = strtok_r(NULL, ",", &saveptr);
+    }
+
+    free(device_list);
+
+    if (has_invalid_format) {
+        UCC_ERROR("Disabling UCC due to invalid UCX_NET_DEVICES format. "
+                  "To fix: Use format like 'mlx5_0:1' or 'mlx5_0:1,mlx5_1:1' "
+                  "or unset UCX_NET_DEVICES to use defaults.");
+        return OMPI_ERROR;
+    }
+
+    UCC_VERBOSE(3, "UCX_NET_DEVICES validation passed");
+    return OMPI_SUCCESS;
+}
+
 static int mca_coll_ucc_init_ctx(ompi_communicator_t* comm)
 {
     mca_coll_ucc_component_t     *cm = &mca_coll_ucc_component;
@@ -261,6 +380,13 @@ static int mca_coll_ucc_init_ctx(ompi_communicator_t* comm)
     ucc_lib_params_t              lib_params;
     ucc_context_params_t          ctx_params;
     unsigned                      ucc_api_major, ucc_api_minor, ucc_api_patch;
+
+    /* Pre-flight check: Validate UCX_NET_DEVICES format before UCC initialization */
+    if (OMPI_SUCCESS != mca_coll_ucc_validate_ucx_devices()) {
+        UCC_ERROR("UCX_NET_DEVICES validation failed. Disabling UCC.");
+        cm->ucc_enable = 0;
+        return OMPI_ERROR;
+    }
 
     ucc_get_version(&ucc_api_major, &ucc_api_minor, &ucc_api_patch);
 
