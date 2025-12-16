@@ -10,6 +10,91 @@
 
 #include "coll_ucc_common.h"
 
+#if UCC_API_VERSION >= UCC_VERSION(1, 7)
+static inline
+mca_coll_ucc_scatter_init_common(const void *sbuf, size_t scount,
+                                 struct ompi_datatype_t *sdtype,
+                                 void *rbuf, size_t rcount,
+                                 struct ompi_datatype_t *rdtype, int root,
+                                 bool persistent, mca_coll_ucc_module_t *ucc_module,
+                                 ucc_coll_req_h *req,
+                                 mca_coll_ucc_req_t *coll_req)
+{
+    ucc_datatype_t ucc_sdt = COLL_UCC_DT_UNSUPPORTED, ucc_rdt = COLL_UCC_DT_UNSUPPORTED;
+    bool is_inplace = (MPI_IN_PLACE == rbuf);
+    int comm_rank = ompi_comm_rank(ucc_module->comm);
+    int comm_size = ompi_comm_size(ucc_module->comm);
+    uint64_t flags = 0;
+    ucc_status_t status;
+
+    /* Local checks - convert datatypes if valid */
+    if (comm_rank == root) {
+        if ((is_inplace || ompi_datatype_is_contiguous_memory_layout(rdtype, rcount)) &&
+            ompi_datatype_is_contiguous_memory_layout(sdtype, scount * comm_size)) {
+            ucc_sdt = ompi_dtype_to_ucc_dtype(sdtype);
+            if (!is_inplace) {
+                ucc_rdt = ompi_dtype_to_ucc_dtype(rdtype);
+            }
+
+            if ((COLL_UCC_DT_UNSUPPORTED == ucc_sdt) ||
+                (COLL_UCC_DT_UNSUPPORTED == ucc_rdt)) {
+                UCC_VERBOSE(5, "ompi_datatype is not supported: dtype = %s",
+                            (COLL_UCC_DT_UNSUPPORTED == ucc_sdt) ?
+                            sdtype->super.name : rdtype->super.name);
+            }
+        }
+    } else {
+        if (ompi_datatype_is_contiguous_memory_layout(rdtype, rcount)) {
+            ucc_rdt = ompi_dtype_to_ucc_dtype(rdtype);
+            if (COLL_UCC_DT_UNSUPPORTED == ucc_rdt) {
+                UCC_VERBOSE(5, "ompi_datatype is not supported: dtype = %s",
+                            rdtype->super.name);
+            }
+        } else {
+            ucc_rdt = COLL_UCC_DT_UNSUPPORTED;
+        }
+    }
+
+    /* Build coll args - will have COLL_UCC_DT_UNSUPPORTED if local checks failed */
+    flags = (is_inplace ? UCC_COLL_ARGS_FLAG_IN_PLACE : 0) |
+            (persistent ? UCC_COLL_ARGS_FLAG_PERSISTENT : 0);
+
+    ucc_coll_args_t coll = {
+        .mask      = flags ? UCC_COLL_ARGS_FIELD_FLAGS : 0,
+        .flags     = flags,
+        .coll_type = UCC_COLL_TYPE_SCATTER,
+        .root      = root,
+        .src.info  = {
+            .buffer   = (void*)sbuf,
+            .count    = scount * comm_size,
+            .datatype = ucc_sdt,
+            .mem_type = UCC_MEMORY_TYPE_UNKNOWN
+        },
+        .dst.info = {
+            .buffer   = (void*)rbuf,
+            .count    = rcount,
+            .datatype = ucc_rdt,
+            .mem_type = UCC_MEMORY_TYPE_UNKNOWN
+        },
+    };
+
+    /* COLLECTIVE CHECK - ALL ranks participate, detects all issues */
+    status = ucc_dt_check_rooted_collective(ucc_module->ucc_team, &coll, comm_rank);
+    if (UCC_OK != status) {
+        if (status == UCC_ERR_NOT_SUPPORTED) {
+            UCC_VERBOSE(5, "scatter: non-contiguous datatype detected across ranks");
+        } else if (status == UCC_ERR_INVALID_PARAM) {
+            UCC_VERBOSE(5, "scatter: asymmetric datatypes or memory types detected");
+        }
+        goto fallback;
+    }
+
+    COLL_UCC_REQ_INIT(coll_req, req, coll, ucc_module);
+    return UCC_OK;
+fallback:
+    return UCC_ERR_NOT_SUPPORTED;
+}
+#else /* UCC_API_VERSION < UCC_VERSION(1, 7) */
 static inline ucc_status_t
 mca_coll_ucc_scatter_init_common(const void *sbuf, size_t scount,
                                  struct ompi_datatype_t *sdtype,
@@ -83,6 +168,7 @@ mca_coll_ucc_scatter_init_common(const void *sbuf, size_t scount,
 fallback:
     return UCC_ERR_NOT_SUPPORTED;
 }
+#endif /* UCC_API_VERSION */
 
 int mca_coll_ucc_scatter(const void *sbuf, size_t scount,
                          struct ompi_datatype_t *sdtype, void *rbuf, size_t rcount,
